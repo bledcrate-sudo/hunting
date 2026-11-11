@@ -20,6 +20,10 @@
 | 3 | Auth token + userId in a log format string (`HTLoginSuccessModel send token: %@, userId: %@`) | Low–Medium | Medium | NEEDS-DYNAMIC (confirm it reaches device log in release) |
 | 4 | "Remember password" stores the account **password** locally (AES); key management unknown | Low–Medium | Medium | NEEDS-DYNAMIC (recover key / inspect container) |
 | 5 | Possible open-redirect pivot on first-party domain (`/api/deeplink/redirect`, `openredirect=1`) feeding in-app WebView | Med–High (as a chain) | Low | NEEDS-DYNAMIC (server-side test) |
+| 6 | **Invisible room listening** — Agora RTC token (`/livehub/rtc_token`) + channel join are decoupled from app-level presence (`/livehub/user/join`), enabling audio/video receipt without appearing in the member list | High (abuse/safety) | Medium (architecture) | NEEDS-DYNAMIC |
+| 7 | **Un-kickable (media layer)** — kick is an app signal + client-driven `leaveChannel`; if the server doesn't revoke the Agora token / ban server-side, a modified client stays in the audio channel | High (abuse/safety) | Medium (architecture) | NEEDS-DYNAMIC |
+| 8 | **Un-kickable (presence layer)** — `/livehub/user/heartbeat` keeps you "in the room"; if the server doesn't blocklist a kicked uid, replaying heartbeat keeps membership | Medium | Medium (architecture) | NEEDS-DYNAMIC |
+| 9 | **Block partly client-enforced** — receive-side `isBlocked(chatId:type:messageTime:)` + `filterBlockedMomentsJSON`; if the server still delivers blocked users' content/messages, block is bypassable (modified receiver sees them; sender-side bypass possible) | Medium–High (abuse/safety) | Medium | NEEDS-DYNAMIC |
 
 **Verified NOT issues (checked, ruled out):** no embedded private keys (the `BEGIN … PRIVATE KEY` strings are empty format templates; only *public* keys are embedded); no hardcoded app/cloud secrets in bundle resource files; third-party SDKs are current (Alamofire 5.9.1, SDWebImage 5.21.1, AgoraRtcKit 4.5.2, FBSDKCoreKit 18.1.0, Moya 15, FMDB 2.7.10) — no obvious outdated-library CVE. Binary is PIE with stack canaries, `cryptid=0` (decrypted copy).
 
@@ -135,6 +139,43 @@ Confirmed by decompilation: the registered `getToken` handler (`0x1052440ac`) lo
 - **Decompiler is now set up here** (capstone + custom chained-fixup selector/ObjC resolver in the session scratchpad: `objc.py`, `dis.py`, `xref.py`). I can keep reversing `HTWebViewSecurityGuard`'s Swift host-match to try to settle the exact operator (exact vs suffix) statically — Swift string-compare is hard but tractable with more effort.
 - **To turn Finding 2 into a submission:** on-device dynamic test (Frida/objection + proxy) is the reliable path — enumerate bridge actions, fuzz the `HTWebViewSecurityGuard` host matcher, and prove an off-allowlist page calling `callNative`.
 - Report Finding 1 now (self-contained); hold 2–5 until validated.
+
+---
+
+## Rooms & DMs — abuse / authorization vectors  *(the class you asked about: invisible join, un-kickable, block bypass)*
+
+**The universal question here:** is each control enforced **server-side** (robust) or **client-side** (a modified client / replayed request bypasses it)? The IPA only shows the *client* half, so these are **architecture-derived hypotheses with strong static backing** — each needs one on-device test against the server to confirm. They are exactly the high-value "safety/abuse" bugs HelloTalk's program cares about.
+
+**Confirmed architecture (from the binary):** voice/live rooms use **Agora RTC**. Three things are **decoupled**:
+1. **Media:** RTC token from `/livehub/rtc_token` (+ `/livehub/publisher_rtc_token`), then `joinChannelByToken:channelId:uid:mediaOptions:` — the actual audio/video.
+2. **Presence:** `/livehub/user/join` + periodic `/livehub/user/heartbeat` — what puts you in the member list / online count.
+3. **Moderation:** `/livehub/user/kick`, `/livehub/stage/kick`, `/livehub/stage/device_control` (mute) — HTTP calls made by the *host's* client.
+The kicked client receives a **reason code** and maps it to UI text (`Violation removed from room` / `Administrator moves out of room` / `Anchor moves out…` — handler at `0x104979034`), then leaves **voluntarily**.
+
+### Finding 6 — Invisible room listening *(High, NEEDS-DYNAMIC)*
+Because the **RTC token endpoint is separate from `/livehub/user/join`**, the test is: request `/livehub/channel_basic_info` (or `/livehub/batch_query_channel`) → `/livehub/rtc_token?channelName=…` → `joinChannelByToken`, **without** calling `/livehub/user/join`. If the server issues a token to anyone who knows the channel and doesn't tie media to presence, you receive all room audio/video while appearing in **no** member list or online count — a silent lurker.
+- **Test:** join a room's Agora channel via the token endpoint only; verify host/members never see you and you still hear audio.
+- **Server fix:** issue RTC tokens only after an authorized `/livehub/user/join`; reconcile the Agora channel roster against presence; treat unexpected uids as intruders.
+
+### Finding 7 — Un-kickable at the media layer *(High, NEEDS-DYNAMIC)*
+Kick is an app-level signal; the victim's client calls `leaveChannel` on its own. Agora tokens are **renewed by the client** (`refreshRtcToken`/`getRtcToken`). If `/livehub/user/kick` doesn't (a) invoke Agora's server-side kicking/ban API and (b) refuse token refresh for that uid, a modified client that **ignores the kick notice** keeps its valid token and stays in the audio channel — still hearing and (if a speaker) still talking.
+- **Test:** get kicked; hook/skip the "removed by host" handler; confirm Agora audio continues; see whether `refreshRtcToken` is refused at token expiry.
+- **Server fix:** on kick, call Agora kicking-rule/ban for the uid and invalidate its token; don't rely on the client leaving.
+
+### Finding 8 — Un-kickable at the presence layer *(Medium, NEEDS-DYNAMIC)*
+Membership = server sees your `/livehub/user/heartbeat`. If the server doesn't blocklist a kicked uid, a client that keeps POSTing heartbeat stays in the member list / online count even after being "removed."
+- **Test:** after kick, keep replaying `/livehub/user/heartbeat`; check if you remain listed.
+- **Server fix:** mark kicked uid as ejected for the channel; reject its heartbeat/rejoin for a cooldown.
+
+### Finding 9 — Block is partly client-enforced *(Medium–High, NEEDS-DYNAMIC)*
+Block is a server list (`/profile/setting/privacy/blacklist`), **but** the receive path also filters locally: `isBlocked(chatId:type:messageTime:) -> Bool` (HelloMessage) and `filterBlockedMomentsJSON` (client strips blocked users' moments out of server JSON). Client-side filtering implies the **server may still deliver** blocked users' content. Two bypasses to test:
+- **Receiver-side:** a modified client that skips `isBlocked`/`filterBlockedMoments` still **receives and can display** messages/moments from people it blocked (defeats the point of blocking).
+- **Sender-side:** if "you can't message someone who blocked you" is only a client check, a modified sender **still delivers DMs** to a user who blocked them. The time-based param (`messageTime`) also hints at race windows around the block moment.
+- **Test:** B blocks A; from a modified A, send a DM / post a moment; confirm whether it reaches B's server inbox (not just B's UI). Inspect whether the server returns a block error on send or silently accepts.
+- **Server fix:** enforce block on **delivery** (drop at the server for both DM and moments/comments); return an authoritative error on send from a blocked sender.
+
+### Related (likely intended, not bugs — but verify server-side)
+The app has real invisibility/privacy features: `VisitInvisible` (browse profiles without appearing in "visitors"), `profileStealth`, per-user/all "appear offline" setters (`…ToUser(userId:, invisible:)`, `…ToAll(invisible:)`), and `showLocation`/`onlineStatus` switches. These are intended features; the only security angle is the same server-vs-client question — e.g., if "visit invisible" is enforced only by the client **not sending** the visit, that's fine, but if the server records the visit and the *viewer's* client just hides it from the visited user, the data still exists and could leak via another endpoint. Low priority vs. 6–9.
 
 ---
 
