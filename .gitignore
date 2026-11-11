@@ -1,0 +1,4 @@
+# never commit app binaries / large artifacts
+*.ipa
+extracted/
+*.strings
